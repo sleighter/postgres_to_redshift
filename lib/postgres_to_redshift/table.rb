@@ -13,11 +13,12 @@
 #
 class PostgresToRedshift
   class Table
-    attr_accessor :attributes, :columns
+    attr_accessor :attributes, :columns, :table_part
 
     def initialize(attributes: , columns: [])
       self.attributes = attributes
       self.columns = columns
+      self.table_part = attributes[:table_part]
     end
 
     def name
@@ -36,19 +37,23 @@ class PostgresToRedshift
     end
 
     def columns_for_create
-      columns.map do |column|
+      columns.reject{|c| ['USER-DEFINED','int4range','ARRAY'].include?(c.data_type_for_copy) }.map do |column|
         %Q["#{column.name}" #{column.data_type_for_copy}]
       end.join(", ")
     end
 
     def columns_for_copy
-      columns.map do |column|
+      columns.reject{|c| ['USER-DEFINED','int4range','ARRAY'].include?(c.data_type_for_copy) }.map do |column|
         column.name_for_copy
       end.join(", ")
     end
 
     def is_view?
       attributes["table_type"] == "VIEW"
+    end
+
+    def order_by
+      columns.any? {|c| c.name == 'id'} ? 'id' : columns.first.name
     end
   end
 end

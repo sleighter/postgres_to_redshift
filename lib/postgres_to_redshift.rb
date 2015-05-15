@@ -8,6 +8,9 @@ require "postgres_to_redshift/table"
 require "postgres_to_redshift/column"
 
 class PostgresToRedshift
+
+  PART_SIZE = 10000
+
   class << self
     attr_accessor :source_uri, :target_uri
   end
@@ -18,12 +21,29 @@ class PostgresToRedshift
     update_tables = PostgresToRedshift.new
 
     update_tables.tables.each do |table|
-      target_connection.exec("CREATE TABLE IF NOT EXISTS public.#{table.target_table_name} (#{table.columns_for_create})")
-
-      update_tables.copy_table(table)
-
-      update_tables.import_table(table)
+      self.update_table(table)
     end
+  end
+
+  def self.update_table(table)
+    puts "Starting migration process with settings: " +
+      "POSTGRES_TO_REDSHIFT_SOURCE_URI:  #{ENV['POSTGRES_TO_REDSHIFT_SOURCE_URI']}" +
+      "S3_DATABASE_EXPORT_ID:            #{ENV['S3_DATABASE_EXPORT_ID']}"           +
+      "S3_DATABASE_EXPORT_KEY:           #{ENV['S3_DATABASE_EXPORT_KEY']}"          +
+      "POSTGRES_TO_REDSHIFT_TARGET_URI:  #{ENV['POSTGRES_TO_REDSHIFT_TARGET_URI']}" +
+      "S3_DATABASE_EXPORT_BUCKET:        #{ENV['S3_DATABASE_EXPORT_BUCKET']}"       +
+      "S3_DATABASE_EXPORT_BUCKET_REGION: #{ENV['S3_DATABASE_EXPORT_BUCKET_REGION']}"
+
+
+
+    puts "Creating Table: #{table.target_table_name}"
+    target_connection.exec("CREATE TABLE IF NOT EXISTS public.#{table.target_table_name} (#{table.columns_for_create})")
+
+    puts "Copying Table #{table.target_table_name} Part #{table.table_part} from Postgres"
+    update_tables.copy_table(table)
+
+    puts "Importing Table #{table.target_table_name} Part #{table.table_part} to Redshift"
+    update_tables.import_table(table)
   end
 
   def self.source_uri
@@ -51,6 +71,13 @@ class PostgresToRedshift
     @target_connection
   end
 
+  def self.drop_target_tables
+    PostgresToRedshift.new.target_table_names.each do |table_name|
+      puts "Dropping #{table_name} on target"
+      target_connection.exec("DROP TABLE IF EXISTS #{table_name}")
+    end
+  end
+
   def source_connection
     self.class.source_connection
   end
@@ -59,61 +86,104 @@ class PostgresToRedshift
     self.class.target_connection
   end
 
-  def tables
-    source_connection.exec("SELECT * FROM information_schema.tables WHERE table_schema = 'public' AND table_type in ('BASE TABLE', 'VIEW')").map do |table_attributes|
+  def unique_tables
+    @unique_tables ||= source_connection.exec("SELECT * FROM information_schema.tables WHERE table_schema = 'public' AND table_type in ('BASE TABLE')").map do |table_attributes|
       table = Table.new(attributes: table_attributes)
-      next if table.name =~ /^pg_/
+      next if table.name =~ /(^pg_|_sys$|_catalog$|^geography_columns$|^subscriptions$|^content$|^driver_locations$)/
       table.columns = column_definitions(table)
       table
     end.compact
   end
 
+  def tables
+    @tables ||= source_connection.exec("SELECT * FROM information_schema.tables WHERE table_schema = 'public' AND table_type in ('BASE TABLE')").flat_map do |table_attributes|
+      table = Table.new(attributes: table_attributes.merge(table_part: 1))
+      next if table.name =~ /(^pg_|_sys$|_catalog$|^geography_columns$|^subscriptions$|^content$|^driver_locations$|^monthly_order_counts$)/
+      rows = row_count(table)
+      if rows > PART_SIZE
+        table_parts = []
+        count = 0
+        part_count = 1
+        while count < rows
+          t = Table.new(attributes: table_attributes.merge(table_part: part_count))
+          t.columns = column_definitions(t)
+          table_parts << t
+          count += PART_SIZE
+          part_count += 1
+        end
+        table_parts
+      else
+        table.columns = column_definitions(table)
+        table
+      end
+    end.compact
+  end
+
+  def target_table_names
+    result = target_connection.exec("SELECT * FROM information_schema.tables WHERE table_schema = 'public' AND table_type in ('BASE TABLE')")
+    result.map { |r| r['table_name'] }
+  end
+
+  def row_count(table)
+    source_connection.exec("SELECT COUNT(*) FROM #{table.name}").getvalue(0,0).to_i
+  end
+
   def column_definitions(table)
-    source_connection.exec("SELECT * FROM information_schema.columns WHERE table_schema='public' AND table_name='#{table.name}' order by ordinal_position")
+    source_connection.exec("SELECT * FROM information_schema.columns WHERE table_schema='public' AND table_name='#{table.name}' AND column_name NOT IN ('area_geometry') order by ordinal_position")
   end
 
   def s3
-    @s3 ||= AWS::S3.new(access_key_id: ENV['S3_DATABASE_EXPORT_ID'], secret_access_key: ENV['S3_DATABASE_EXPORT_KEY'])
+    @s3 ||= build_s3
+  end
+  
+  def build_s3
+    AWS.config({
+      :access_key_id => ENV['S3_DATABASE_EXPORT_ID'],
+      :secret_access_key => ENV['S3_DATABASE_EXPORT_KEY']
+    })
+    Aws::S3::Resource.new(region: ENV['S3_DATABASE_EXPORT_BUCKET_REGION'])
   end
 
   def bucket
-    @bucket ||= s3.buckets[ENV['S3_DATABASE_EXPORT_BUCKET']]
+    @bucket ||= s3.bucket(ENV['S3_DATABASE_EXPORT_BUCKET'])
   end
 
   def copy_table(table)
-    buffer = StringIO.new
-    zip = Zlib::GzipWriter.new(buffer)
+    puts "Writing to file #{table.target_table_name}_#{table.table_part}.psv.gz"
+    File.open("#{table.target_table_name}_#{table.table_part}.psv.gz", "w+") do |buffer|
+      zip = Zlib::GzipWriter.new(buffer)
 
-    puts "Downloading #{table}"
-    copy_command = "COPY (SELECT #{table.columns_for_copy} FROM #{table.name}) TO STDOUT WITH DELIMITER '|'"
+      puts "Downloading #{table.name}"
 
-    source_connection.copy_data(copy_command) do
-      while row = source_connection.get_copy_data
-        zip.write(row)
+      copy_command = "COPY (SELECT #{table.columns_for_copy} FROM #{table.name} ORDER BY #{table.order_by} LIMIT #{PART_SIZE} OFFSET #{(table.table_part - 1) * PART_SIZE}) TO STDOUT WITH DELIMITER '|'"
+
+      source_connection.copy_data(copy_command) do
+        while row = source_connection.get_copy_data
+          zip.write(row)
+        end
       end
+      zip.finish
+      buffer.rewind
+      upload_table(table, buffer)
     end
-    zip.finish
-    buffer.rewind
-    upload_table(table, buffer)
+
+    #File.delete("#{table.target_table_name}_#{table.table_part}.psv.gz")
   end
 
   def upload_table(table, buffer)
-    puts "Uploading #{table.target_table_name}"
-    bucket.objects["export/#{table.target_table_name}.psv.gz"].delete
-    bucket.objects["export/#{table.target_table_name}.psv.gz"].write(buffer, acl: :authenticated_read)
+    puts "Uploading #{table.target_table_name}_#{table.table_part}"
+    obj = bucket.object("export/#{table.target_table_name}_#{table.table_part}.psv.gz")
+    obj.upload_file("#{table.target_table_name}_#{table.table_part}.psv.gz")
   end
 
   def import_table(table)
-    puts "Importing #{table.target_table_name}"
-    target_connection.exec("DROP TABLE IF EXISTS public.#{table.target_table_name}_updating")
+    puts "Importing #{table.target_table_name} Part #{table.table_part}"
 
     target_connection.exec("BEGIN;")
 
-    target_connection.exec("ALTER TABLE public.#{table.target_table_name} RENAME TO #{table.target_table_name}_updating")
+    target_connection.exec("CREATE TABLE IF NOT EXISTS public.#{table.target_table_name} (#{table.columns_for_create})")
 
-    target_connection.exec("CREATE TABLE public.#{table.target_table_name} (#{table.columns_for_create})")
-
-    target_connection.exec("COPY public.#{table.target_table_name} FROM 's3://#{ENV['S3_DATABASE_EXPORT_BUCKET']}/export/#{table.target_table_name}.psv.gz' CREDENTIALS 'aws_access_key_id=#{ENV['S3_DATABASE_EXPORT_ID']};aws_secret_access_key=#{ENV['S3_DATABASE_EXPORT_KEY']}' GZIP TRUNCATECOLUMNS ESCAPE DELIMITER as '|';")
+    target_connection.exec("COPY public.#{table.target_table_name} FROM 's3://#{ENV['S3_DATABASE_EXPORT_BUCKET']}/psql_copy/#{table.target_table_name}_#{table.table_part}.psv.gz' CREDENTIALS 'aws_access_key_id=#{ENV['S3_DATABASE_EXPORT_ID']};aws_secret_access_key=#{ENV['S3_DATABASE_EXPORT_KEY']}' GZIP TRUNCATECOLUMNS ESCAPE DELIMITER as '|'")
 
     target_connection.exec("COMMIT;")
   end
