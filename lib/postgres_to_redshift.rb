@@ -9,7 +9,7 @@ require "postgres_to_redshift/column"
 
 class PostgresToRedshift
 
-  PART_SIZE = 10000
+  PART_SIZE = 100000
 
   class << self
     attr_accessor :source_uri, :target_uri
@@ -18,6 +18,13 @@ class PostgresToRedshift
   attr_reader :source_connection, :target_connection, :s3
 
   def self.update_tables
+    puts "Starting migration process with settings: \n" +
+      "POSTGRES_TO_REDSHIFT_SOURCE_URI:  #{ENV['POSTGRES_TO_REDSHIFT_SOURCE_URI']}\n" +
+      "S3_DATABASE_EXPORT_ID:            #{ENV['S3_DATABASE_EXPORT_ID']}\n"           +
+      "S3_DATABASE_EXPORT_KEY:           #{ENV['S3_DATABASE_EXPORT_KEY']}\n"          +
+      "POSTGRES_TO_REDSHIFT_TARGET_URI:  #{ENV['POSTGRES_TO_REDSHIFT_TARGET_URI']}\n" +
+      "S3_DATABASE_EXPORT_BUCKET:        #{ENV['S3_DATABASE_EXPORT_BUCKET']}\n"       +
+      "S3_DATABASE_EXPORT_BUCKET_REGION: #{ENV['S3_DATABASE_EXPORT_BUCKET_REGION']}\n"
     update_tables = PostgresToRedshift.new
 
     update_tables.tables.each do |table|
@@ -26,16 +33,6 @@ class PostgresToRedshift
   end
 
   def self.update_table(table)
-    puts "Starting migration process with settings: " +
-      "POSTGRES_TO_REDSHIFT_SOURCE_URI:  #{ENV['POSTGRES_TO_REDSHIFT_SOURCE_URI']}" +
-      "S3_DATABASE_EXPORT_ID:            #{ENV['S3_DATABASE_EXPORT_ID']}"           +
-      "S3_DATABASE_EXPORT_KEY:           #{ENV['S3_DATABASE_EXPORT_KEY']}"          +
-      "POSTGRES_TO_REDSHIFT_TARGET_URI:  #{ENV['POSTGRES_TO_REDSHIFT_TARGET_URI']}" +
-      "S3_DATABASE_EXPORT_BUCKET:        #{ENV['S3_DATABASE_EXPORT_BUCKET']}"       +
-      "S3_DATABASE_EXPORT_BUCKET_REGION: #{ENV['S3_DATABASE_EXPORT_BUCKET_REGION']}"
-
-
-
     puts "Creating Table: #{table.target_table_name}"
     target_connection.exec("CREATE TABLE IF NOT EXISTS public.#{table.target_table_name} (#{table.columns_for_create})")
 
@@ -110,9 +107,11 @@ class PostgresToRedshift
           table_parts << t
           count += PART_SIZE
           part_count += 1
+          puts "Found #{t.name} Part #{t.table_part}"
         end
         table_parts
       else
+        puts "Found #{table.name} Part #{table.table_part}"
         table.columns = column_definitions(table)
         table
       end
@@ -135,7 +134,7 @@ class PostgresToRedshift
   def s3
     @s3 ||= build_s3
   end
-  
+
   def build_s3
     AWS.config({
       :access_key_id => ENV['S3_DATABASE_EXPORT_ID'],
@@ -186,5 +185,10 @@ class PostgresToRedshift
     target_connection.exec("COPY public.#{table.target_table_name} FROM 's3://#{ENV['S3_DATABASE_EXPORT_BUCKET']}/psql_copy/#{table.target_table_name}_#{table.table_part}.psv.gz' CREDENTIALS 'aws_access_key_id=#{ENV['S3_DATABASE_EXPORT_ID']};aws_secret_access_key=#{ENV['S3_DATABASE_EXPORT_KEY']}' GZIP TRUNCATECOLUMNS ESCAPE DELIMITER as '|'")
 
     target_connection.exec("COMMIT;")
+  end
+
+  def puts(msg)
+    super(msg)
+    STDOUT.flush
   end
 end
