@@ -85,7 +85,7 @@ class PostgresToRedshift
 
   def unique_tables
     @unique_tables ||= source_connection.exec("SELECT * FROM information_schema.tables WHERE table_schema = 'public' AND table_type in ('BASE TABLE')").map do |table_attributes|
-      table = Table.new(attributes: table_attributes)
+      table = Table.new(attributes: table_attributes.merge(table_part: 1))
       next if table.name =~ /(^pg_|_sys$|_catalog$|^geography_columns$|^subscriptions$|^content$|^driver_locations$)/
       table.columns = column_definitions(table)
       table
@@ -136,9 +136,8 @@ class PostgresToRedshift
   end
 
   def build_s3
-    AWS.config({
-      :access_key_id => ENV['S3_DATABASE_EXPORT_ID'],
-      :secret_access_key => ENV['S3_DATABASE_EXPORT_KEY']
+    Aws.config.update({
+      credentials: Aws::Credentials.new(ENV['S3_DATABASE_EXPORT_ID'], ENV['S3_DATABASE_EXPORT_KEY']),
     })
     Aws::S3::Resource.new(region: ENV['S3_DATABASE_EXPORT_BUCKET_REGION'])
   end
@@ -162,14 +161,14 @@ class PostgresToRedshift
         end
       end
       zip.finish
-      buffer.rewind
-      upload_table(table, buffer)
     end
 
-    #File.delete("#{table.target_table_name}_#{table.table_part}.psv.gz")
+    upload_table(table)
+
+    File.delete("#{table.target_table_name}_#{table.table_part}.psv.gz")
   end
 
-  def upload_table(table, buffer)
+  def upload_table(table)
     puts "Uploading #{table.target_table_name}_#{table.table_part}"
     obj = bucket.object("export/#{table.target_table_name}_#{table.table_part}.psv.gz")
     obj.upload_file("#{table.target_table_name}_#{table.table_part}.psv.gz")
@@ -182,7 +181,7 @@ class PostgresToRedshift
 
     target_connection.exec("CREATE TABLE IF NOT EXISTS public.#{table.target_table_name} (#{table.columns_for_create})")
 
-    target_connection.exec("COPY public.#{table.target_table_name} FROM 's3://#{ENV['S3_DATABASE_EXPORT_BUCKET']}/psql_copy/#{table.target_table_name}_#{table.table_part}.psv.gz' CREDENTIALS 'aws_access_key_id=#{ENV['S3_DATABASE_EXPORT_ID']};aws_secret_access_key=#{ENV['S3_DATABASE_EXPORT_KEY']}' GZIP TRUNCATECOLUMNS ESCAPE DELIMITER as '|'")
+    target_connection.exec("COPY public.#{table.target_table_name} FROM 's3://#{ENV['S3_DATABASE_EXPORT_BUCKET']}/export/#{table.target_table_name}_#{table.table_part}.psv.gz' CREDENTIALS 'aws_access_key_id=#{ENV['S3_DATABASE_EXPORT_ID']};aws_secret_access_key=#{ENV['S3_DATABASE_EXPORT_KEY']}' GZIP TRUNCATECOLUMNS ESCAPE DELIMITER as '|'")
 
     target_connection.exec("COMMIT;")
   end
