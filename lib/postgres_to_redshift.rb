@@ -28,19 +28,8 @@ class PostgresToRedshift
     update_tables = PostgresToRedshift.new
 
     update_tables.tables.each do |table|
-      self.update_table(table)
+      update_tables.update_table(table)
     end
-  end
-
-  def self.update_table(table)
-    puts "Creating Table: #{table.target_table_name}"
-    target_connection.exec("CREATE TABLE IF NOT EXISTS public.#{table.target_table_name} (#{table.columns_for_create})")
-
-    puts "Copying Table #{table.target_table_name} Part #{table.table_part} from Postgres"
-    update_tables.copy_table(table)
-
-    puts "Importing Table #{table.target_table_name} Part #{table.table_part} to Redshift"
-    update_tables.import_table(table)
   end
 
   def self.source_uri
@@ -75,6 +64,17 @@ class PostgresToRedshift
     end
   end
 
+  def update_table(table)
+    puts "Creating Table: #{table.target_table_name}"
+    target_connection.exec("CREATE TABLE IF NOT EXISTS public.#{table.target_table_name} (#{table.columns_for_create})")
+
+    puts "Copying Table #{table.target_table_name} Part #{table.table_part} from Postgres"
+    copy_table(table)
+
+    puts "Importing Table #{table.target_table_name} Part #{table.table_part} to Redshift"
+    import_table(table)
+  end
+
   def source_connection
     self.class.source_connection
   end
@@ -93,7 +93,7 @@ class PostgresToRedshift
   end
 
   def tables
-    @tables ||= source_connection.exec("SELECT * FROM information_schema.tables WHERE table_schema = 'public' AND table_type in ('BASE TABLE')").flat_map do |table_attributes|
+    @tables ||= source_connection.exec("SELECT * FROM information_schema.tables WHERE table_schema = 'public' AND table_type in ('BASE TABLE')").each_with_index.flat_map do |table_attributes,index|
       table = Table.new(attributes: table_attributes.merge(table_part: 1))
       next if table.name =~ /(^pg_|_sys$|_catalog$|^geography_columns$|^subscriptions$|^content$|^driver_locations$|^monthly_order_counts$)/
       rows = row_count(table)
@@ -107,11 +107,11 @@ class PostgresToRedshift
           table_parts << t
           count += PART_SIZE
           part_count += 1
-          puts "Found #{t.name} Part #{t.table_part}"
+          puts "[Table ##{index}] Found #{t.name} Part #{t.table_part}"
         end
         table_parts
       else
-        puts "Found #{table.name} Part #{table.table_part}"
+        puts "[Table ##{index}] Found #{table.name} Part #{table.table_part}"
         table.columns = column_definitions(table)
         table
       end
