@@ -17,8 +17,10 @@ class PostgresToRedshift
 
   attr_reader :source_connection, :target_connection, :s3
 
+  @errors = []
   def self.update_tables
-    puts "Starting migration process with settings: \n" +
+    @start_time = Time.current
+    puts "#{@start_time}Starting migration process with settings: \n" +
       "POSTGRES_TO_REDSHIFT_SOURCE_URI:  #{ENV['POSTGRES_TO_REDSHIFT_SOURCE_URI']}\n" +
       "S3_DATABASE_EXPORT_ID:            #{ENV['S3_DATABASE_EXPORT_ID']}\n"           +
       "S3_DATABASE_EXPORT_KEY:           #{ENV['S3_DATABASE_EXPORT_KEY']}\n"          +
@@ -26,10 +28,16 @@ class PostgresToRedshift
       "S3_DATABASE_EXPORT_BUCKET:        #{ENV['S3_DATABASE_EXPORT_BUCKET']}\n"       +
       "S3_DATABASE_EXPORT_BUCKET_REGION: #{ENV['S3_DATABASE_EXPORT_BUCKET_REGION']}\n"
     update_tables = PostgresToRedshift.new
+    tables_to_update = update_tables.tables
 
-    update_tables.tables.each do |table|
+    tables_to_update.each_with_index do |table,index|
+      puts "Processing Part #{index} of #{tables_to_update.count} [#{(index * 1.0 / tables_to_update.count).round(2)}%]" rescue nil
       update_tables.update_table(table)
     end
+    @total_time = Time.current - @start_time
+    puts ("Total run time: #{@total_time} seconds")
+    puts "Suppressed Errors: "
+    puts @errors.join('\n')
   end
 
   def self.source_uri
@@ -146,26 +154,34 @@ class PostgresToRedshift
     @bucket ||= s3.bucket(ENV['S3_DATABASE_EXPORT_BUCKET'])
   end
 
+  def dump_exists(table)
+    bucket.object("export/#{table.target_table_name}_#{table.table_part}.psv.gz").content_length > 0
+  end
+
   def copy_table(table)
-    puts "Writing to file #{table.target_table_name}_#{table.table_part}.psv.gz"
-    File.open("#{table.target_table_name}_#{table.table_part}.psv.gz", "w+") do |buffer|
-      zip = Zlib::GzipWriter.new(buffer)
+    unless dump_exists(table)
+      puts "Writing to file #{table.target_table_name}_#{table.table_part}.psv.gz"
+      File.open("#{table.target_table_name}_#{table.table_part}.psv.gz", "w+") do |buffer|
+        zip = Zlib::GzipWriter.new(buffer)
 
-      puts "Downloading #{table.name}"
+        puts "Downloading #{table.name}"
 
-      copy_command = "COPY (SELECT #{table.columns_for_copy} FROM #{table.name} ORDER BY #{table.order_by} LIMIT #{PART_SIZE} OFFSET #{(table.table_part - 1) * PART_SIZE}) TO STDOUT WITH DELIMITER '|'"
+        copy_command = "COPY (SELECT #{table.columns_for_copy} FROM #{table.name} ORDER BY #{table.order_by} LIMIT #{PART_SIZE} OFFSET #{(table.table_part - 1) * PART_SIZE}) TO STDOUT WITH DELIMITER '|'"
 
-      source_connection.copy_data(copy_command) do
-        while row = source_connection.get_copy_data
-          zip.write(row)
+        source_connection.copy_data(copy_command) do
+          while row = source_connection.get_copy_data
+            zip.write(row)
+          end
         end
+        zip.finish
       end
-      zip.finish
+
+      upload_table(table)
+
+      File.delete("#{table.target_table_name}_#{table.table_part}.psv.gz")
+    else
+      puts "Dump of #{table.target_table_name} Part #{table.table_part} already exists. Skipping..."
     end
-
-    upload_table(table)
-
-    File.delete("#{table.target_table_name}_#{table.table_part}.psv.gz")
   end
 
   def upload_table(table)
@@ -177,13 +193,17 @@ class PostgresToRedshift
   def import_table(table)
     puts "Importing #{table.target_table_name} Part #{table.table_part}"
 
-    target_connection.exec("BEGIN;")
+    begin
+      target_connection.exec("BEGIN;")
 
-    target_connection.exec("CREATE TABLE IF NOT EXISTS public.#{table.target_table_name} (#{table.columns_for_create})")
+      target_connection.exec("CREATE TABLE IF NOT EXISTS public.#{table.target_table_name} (#{table.columns_for_create})")
 
-    target_connection.exec("COPY public.#{table.target_table_name} FROM 's3://#{ENV['S3_DATABASE_EXPORT_BUCKET']}/export/#{table.target_table_name}_#{table.table_part}.psv.gz' CREDENTIALS 'aws_access_key_id=#{ENV['S3_DATABASE_EXPORT_ID']};aws_secret_access_key=#{ENV['S3_DATABASE_EXPORT_KEY']}' GZIP TRUNCATECOLUMNS ESCAPE DELIMITER as '|'")
+      target_connection.exec("COPY public.#{table.target_table_name} FROM 's3://#{ENV['S3_DATABASE_EXPORT_BUCKET']}/export/#{table.target_table_name}_#{table.table_part}.psv.gz' CREDENTIALS 'aws_access_key_id=#{ENV['S3_DATABASE_EXPORT_ID']};aws_secret_access_key=#{ENV['S3_DATABASE_EXPORT_KEY']}' GZIP TRUNCATECOLUMNS ESCAPE ACCEPTINVCHARS DELIMITER as '|'")
 
-    target_connection.exec("COMMIT;")
+      target_connection.exec("COMMIT;")
+    rescue
+      @errors << "Exception occurred during import of #{table.target_table_name} Part #{table.table_part}"
+    end
   end
 
   def puts(msg)
