@@ -19,7 +19,7 @@ class PostgresToRedshift
 
   @errors = []
   def self.update_tables
-    @start_time = Time.current
+    @start_time = Time.now
     puts "#{@start_time}Starting migration process with settings: \n" +
       "POSTGRES_TO_REDSHIFT_SOURCE_URI:  #{ENV['POSTGRES_TO_REDSHIFT_SOURCE_URI']}\n" +
       "S3_DATABASE_EXPORT_ID:            #{ENV['S3_DATABASE_EXPORT_ID']}\n"           +
@@ -34,7 +34,7 @@ class PostgresToRedshift
       puts "Processing Part #{index} of #{tables_to_update.count} [#{(index * 1.0 / tables_to_update.count).round(2)}%]" rescue nil
       update_tables.update_table(table)
     end
-    @total_time = Time.current - @start_time
+    @total_time = Time.now - @start_time
     puts ("Total run time: #{@total_time} seconds")
     puts "Suppressed Errors: "
     puts @errors.join('\n')
