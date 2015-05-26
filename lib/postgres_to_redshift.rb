@@ -31,7 +31,7 @@ class PostgresToRedshift
     tables_to_update = update_tables.tables
 
     tables_to_update.each_with_index do |table,index|
-      puts "Processing Part #{index} of #{tables_to_update.count} [#{(index * 1.0 / tables_to_update.count).round(2)}%]" rescue nil
+      puts "Processing Part #{index} of #{tables_to_update.count} [#{(index * 100.0 / tables_to_update.count).round(2)}%]" rescue nil
       update_tables.update_table(table)
     end
     @total_time = Time.now - @start_time
