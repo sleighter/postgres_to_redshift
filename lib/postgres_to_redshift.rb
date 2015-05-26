@@ -155,7 +155,7 @@ class PostgresToRedshift
   end
 
   def dump_exists(table)
-    bucket.object("export/#{table.target_table_name}_#{table.table_part}.psv.gz").content_length > 0
+    bucket.object("export/#{table.target_table_name}_#{table.table_part}.psv.gz").content_length > 0 rescue false
   end
 
   def copy_table(table)
