@@ -32,7 +32,11 @@ class PostgresToRedshift
 
     tables_to_update.each_with_index do |table,index|
       puts "Processing Part #{index} of #{tables_to_update.count} [#{(index * 100.0 / tables_to_update.count).round(2)}%]" rescue nil
-      update_tables.update_table(table)
+      begin
+        update_tables.update_table(table)
+      rescue
+        @errors << "Error transferring #{table.name} Part #{table.table_part}"
+      end
     end
     @total_time = Time.now - @start_time
     puts ("Total run time: #{@total_time} seconds")
